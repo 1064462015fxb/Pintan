@@ -1,0 +1,24 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+outputs/
+pintan_stable_products.csv
+pintan_trend_search_results.csv
+
+# Local runtime state and user/product assets (never commit secrets or private data)
+data/pintan.db
+data/assets/
+data/media/
+data/generated_assets/
+data/model_cache/
+data/backups/
+data/server-*.log
+backups/
+*.log
+
+# Local extension/build/editor state
+*.crdownload
+.idea/
+.vscode/

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pintan-agent"
+version = "0.1.0"
+description = "品探 Deep Agents + Skill 选品原型"
+requires-python = ">=3.11"
+dependencies = [
+  "deepagents>=0.7,<0.8",
+  "langchain-openai>=0.3",
+  "pydantic>=2.8",
+  "python-dotenv>=1.0",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "websockets>=14,<17",
+  "SQLAlchemy>=2.0,<3",
+  "Pillow>=10.4,<13",
+  "rembg[cpu]>=2.0.67,<3",
+  "onnxruntime>=1.20,<2",
+  "paddleocr>=3.0,<4",
+  "paddlepaddle>=3.0,<4",
+  "imageio-ffmpeg>=0.6,<1",
+]
+
+[project.scripts]
+pintan = "pintan.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pintan"]
