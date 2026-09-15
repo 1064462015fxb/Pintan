@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 outputs/
+*.zip
+demo_package/
 pintan_stable_products.csv
 pintan_trend_search_results.csv
 
