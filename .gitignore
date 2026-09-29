@@ -17,8 +17,13 @@ data/generated_assets/
 data/model_cache/
 data/backups/
 data/server-*.log
+data/1688_assets/
+data/covers/
+data/templates/
 backups/
 *.log
+artifacts/
+pintan_*.csv
 
 # Local extension/build/editor state
 *.crdownload

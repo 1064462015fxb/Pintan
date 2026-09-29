@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -30,11 +31,12 @@ from .asset_records import resolve
 from .collector import FIELDS, collect_snapshot, validate_1688_offer_url
 from .collector_images import download_asset
 from .database import (BatchSelection, BatchSelectionItem, BusinessRow, CollectedFact, CollectionRun,
-                       CollectorHelper, CollectorTask, ProductAsset, session_scope, utcnow)
+                       CollectorHelper, CollectorTask, ProductAsset, TrendDiscoveryBatch,
+                       DistributionTask, ListingPackage, session_scope, utcnow)
 
 PROTOCOL = 1
-VERSION = "2.4.4"
-COMPATIBLE_VERSIONS = {'2.0.0','2.1.2','2.3.2','2.4.0','2.4.1','2.4.2','2.4.3',VERSION}  # 旧版仅保留单商品兼容；批量任务要求最新版。
+VERSION = "2.7.0"
+COMPATIBLE_VERSIONS = {'2.0.0','2.1.2','2.3.2','2.4.0','2.4.1','2.4.2','2.4.3','2.4.4','2.5.0','2.6.0',VERSION}  # 旧版仅保留采集兼容；铺货辅助要求最新版。
 LABELS = dict(queued="排队", opening="打开网页", reading="读取页面", waiting_user="等待人工处理",
               normalizing="整理资料", downloading="下载图片", completed="完成", partial="部分完成",
               failed="失败", cancelled="已取消", interrupted="已中断")
@@ -50,6 +52,8 @@ ERRORS = {
     "capture_timeout": "页面读取超过时间限制，请检查页面后继续。",
     "helper_disconnected": "助手连接中断，请重新连接后显式重试。",
     "server_restarted": "服务已重启，任务中断；已保存资料和图片保留，可显式重试。",
+    "image_search_unavailable": "1688当前页面没有识别到可用的以图搜图入口。请在助手浏览器手动打开以图搜图后重试。",
+    "invalid_reference_image": "参考图格式或尺寸无效，请选择 PNG、JPG 或 WebP 图片。",
 }
 
 
@@ -114,6 +118,7 @@ class SearchCandidateEvidence(StrictModel):
     is_ad: bool = False
     relevance_rank: int = Field(ge=1, le=500)
     discovery_method: Literal["anchor", "attribute", "embedded-state"] = "anchor"
+    cover_url: str = Field(default="", max_length=2000)
 
 
 class SearchEvidence(StrictModel):
@@ -164,6 +169,14 @@ class CollectorBridge:
                     {"search_queued","opening_search","reading_search","waiting_user","collecting","estimating"}))):
                 data=json.loads(batch.payload);data.update(phase="interrupted",message="服务已重启；已保存候选和商品可继续。")
                 batch.status="interrupted";batch.payload=dump(data);batch.updated_at=utcnow()
+            for batch in s.scalars(select(TrendDiscoveryBatch).where(TrendDiscoveryBatch.status.in_(
+                    {"queued", "collecting", "waiting_user", "supply_search"}))):
+                progress=json.loads(batch.progress_json);progress["message"]="服务已重启；已保存平台证据，可继续未完成平台。"
+                batch.status="interrupted";batch.progress_json=dump(progress);batch.updated_at=utcnow()
+            for task in s.scalars(select(DistributionTask).where(DistributionTask.status.in_(
+                    {'opening','filling','waiting_user'}))):
+                values=json.loads(task.payload or '{}');values.update(message='服务已重启，请重新发起辅助填写。',error_type='server_restarted')
+                task.status='interrupted';task.payload=dump(values);task.updated_at=utcnow()
 
     def read(self, task_id):
         with self.guard, session_scope(self.root) as s:
@@ -196,8 +209,10 @@ class CollectorBridge:
                 connected = h.helper_id in self.connections
                 busy = s.scalar(select(CollectorTask).where(CollectorTask.helper_id == h.helper_id,
                                                            CollectorTask.status.in_(ACTIVE)))
+                listing_busy = s.scalar(select(DistributionTask).where(DistributionTask.helper_id == h.helper_id,
+                    DistributionTask.status.in_({'opening','filling','waiting_user'})))
                 helpers.append(dict(helper_id=h.helper_id, name=h.name, version=h.version,
-                                    connected=connected, busy=bool(connected and busy), last_seen=h.last_seen))
+                                    connected=connected, busy=bool(connected and (busy or listing_busy)), last_seen=h.last_seen))
             return dict(protocol=PROTOCOL, version=VERSION, helpers=helpers,
                         status="busy" if any(h["busy"] for h in helpers) else "connected" if any(h["connected"] for h in helpers) else "offline")
 
@@ -263,6 +278,78 @@ class CollectorBridge:
         await self.dispatch(helper_id)
         return {'batch_id':batch_id,'deduplicated':False}
 
+    async def submit_trend_discovery(self, category, filters):
+        from .trend_discovery import normalize_filters
+        category=str(category or '').strip()[:80]
+        if not category: raise HTTPException(422,'请输入品类')
+        try: filters=normalize_filters(filters or {})
+        except ValueError as exc: raise HTTPException(422,str(exc)) from None
+        with self.guard,session_scope(self.root) as s:
+            helpers=[hid for hid in self.connections if s.get(CollectorHelper,hid).version==VERSION]
+            if not helpers: raise HTTPException(409,f'爆款采集要求采集助手{VERSION}，请重新加载并连接新版扩展')
+            helper_id=sorted(helpers)[0];batch_id='TD-'+uuid.uuid4().hex
+            platforms={name:{'status':'queued','found':0,'detail_completed':0,'message':'等待采集',
+                'surface':'buyin' if name=='douyin' else 'public'} for name in filters['platforms']}
+            progress={'stage':'platform_search','message':'等待助手依次读取平台搜索页','platforms':platforms,
+                'scored':0,'qualified':0,'supply_search':0,'supply_scored':0}
+            s.add(TrendDiscoveryBatch(batch_id=batch_id,helper_id=helper_id,category=category,status='queued',
+                filters_json=dump(filters),progress_json=dump(progress),result_json='{}',error_type=None,
+                created_at=utcnow(),updated_at=utcnow()))
+        await self.dispatch(helper_id)
+        return {'batch_id':batch_id,'deduplicated':False}
+
+    def read_trend_discovery(self,batch_id):
+        from .trend_discovery import batch_view
+        try:return batch_view(self.root,batch_id)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+
+    async def submit_image_batch(self, original_keyword, filters, image_data, mime_type,
+                                 target_count=20, max_candidates=60):
+        """保存用户提供的参考图，并只把本机受限地址交给已配对的浏览器助手。"""
+        from .batch_selection import validate_filters
+        original=str(original_keyword or '以图搜图').strip()[:80] or '以图搜图'
+        try:
+            raw=base64.b64decode(str(image_data or ''), validate=True)
+        except (ValueError, TypeError):
+            raise HTTPException(422, ERRORS['invalid_reference_image']) from None
+        if not 32 <= len(raw) <= 10 * 1024 * 1024:
+            raise HTTPException(422, '参考图需介于 32 B 和 10 MB 之间')
+        allowed={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}
+        mime=str(mime_type or '').lower()
+        if mime not in allowed:
+            raise HTTPException(422, ERRORS['invalid_reference_image'])
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(raw)) as image:
+                width,height=image.size
+                if width < 32 or height < 32 or width * height > 40_000_000:
+                    raise ValueError('invalid dimensions')
+                if image.format not in {'JPEG','PNG','WEBP'}:
+                    raise ValueError('invalid format')
+        except Exception:
+            raise HTTPException(422, ERRORS['invalid_reference_image']) from None
+        filters=validate_filters(filters or {})
+        target_count=max(1,min(20,int(target_count)));max_candidates=max(target_count,min(60,int(max_candidates)))
+        digest=hashlib.sha256(raw).hexdigest();image_dir=self.root/'data'/'image-search';image_dir.mkdir(parents=True,exist_ok=True)
+        path=image_dir/(digest+allowed[mime])
+        if not path.exists():path.write_bytes(raw)
+        with self.guard, session_scope(self.root) as s:
+            latest=[hid for hid in self.connections if s.get(CollectorHelper,hid).version==VERSION]
+            if not latest:raise HTTPException(409,f"以图搜图要求采集助手{VERSION}，请重新加载新版扩展")
+            signature=hashlib.sha256(dump(['image',digest,filters,target_count,max_candidates]).encode()).hexdigest()
+            for old in s.scalars(select(BatchSelection).where(BatchSelection.status.in_(
+                    {"search_queued","opening_search","reading_search","waiting_user","collecting","estimating"}))):
+                if json.loads(old.payload).get('signature')==signature:return {'batch_id':old.batch_id,'deduplicated':True}
+            helper_id=sorted(latest)[0];batch_id='BS-'+uuid.uuid4().hex;token=secrets.token_urlsafe(24)
+            payload={'signature':signature,'phase':'search_queued','message':'等待助手打开1688以图搜图页面','found':0,
+                     'search_kind':'image','reference_image':{'sha256':digest,'mime_type':mime,'path':str(path.relative_to(self.root)),
+                     'width':width,'height':height,'source':'用户上传','token':token}}
+            s.add(BatchSelection(batch_id=batch_id,helper_id=helper_id,original_keyword=original,
+                normalized_keyword='以图搜图',filters_json=dump(filters),target_count=target_count,max_candidates=max_candidates,
+                status='search_queued',payload=dump(payload),created_at=utcnow(),updated_at=utcnow()))
+        await self.dispatch(helper_id)
+        return {'batch_id':batch_id,'deduplicated':False}
+
     def read_batch(self,batch_id):
         from .batch_selection import batch_view
         try:return batch_view(self.root,batch_id)
@@ -286,25 +373,72 @@ class CollectorBridge:
             # 等待人工处理同样占用助手，防止别的任务操作同一页面。
             busy = s.scalar(select(CollectorTask).where(CollectorTask.helper_id == helper_id,
                                                        CollectorTask.status.in_(ACTIVE - {"queued"})))
+            trend_batches=list(s.scalars(select(TrendDiscoveryBatch).where(
+                TrendDiscoveryBatch.helper_id==helper_id,TrendDiscoveryBatch.status.in_({'queued','collecting','waiting_user','supply_search'}))))
+            trend_active=False
+            for trend_batch in trend_batches:
+                state=json.loads(trend_batch.progress_json)
+                supply=json.loads(trend_batch.result_json or '{}').get('supply_jobs',[])
+                if (any(x.get('status') in {'opening','reading'} for x in state.get('platforms',{}).values()) or
+                        any(x.get('status') in {'opening','reading'} for x in supply)):
+                    trend_active=True;break
             search_busy=s.scalar(select(BatchSelection).where(BatchSelection.helper_id==helper_id,
                 BatchSelection.status.in_({"opening_search","reading_search","waiting_user"})))
-            if busy or search_busy or any(self.read(t)["helper_id"] == helper_id for t in self.workers):
+            if busy or search_busy or trend_active or any(self.read(t)["helper_id"] == helper_id for t in self.workers):
                 return
+            trend_batch=next((x for x in trend_batches if x.status in {'queued','collecting','supply_search'}),None)
+            if trend_batch:
+                progress=json.loads(trend_batch.progress_json);platforms=progress.get('platforms',{})
+                platform=next((name for name,state in platforms.items() if state.get('status')=='queued'),None)
+                if platform:
+                    from .trend_discovery import SEARCH_URLS
+                    lease=secrets.token_urlsafe(24);platforms[platform].update(status='opening',lease=lease,
+                        dispatched_at=time.time(),message='正在打开'+platform+'搜索页')
+                    progress.update(stage='platform_search',message='正在采集'+platform+'爆款候选')
+                    trend_batch.status='collecting';trend_batch.progress_json=dump(progress);trend_batch.updated_at=utcnow()
+                    template=SEARCH_URLS['douyin_buyin'] if platform=='douyin' and platforms[platform].get('surface')=='buyin' else SEARCH_URLS[platform]
+                    command={'type':'trend_search','batch_id':trend_batch.batch_id,'lease':lease,'platform':platform,
+                        'category':trend_batch.category,'page_url':template.format(query=quote_from_bytes(trend_batch.category.encode('utf-8'))),
+                        'max_candidates':20,'filters':json.loads(trend_batch.filters_json)}
+                    task_id=trend_batch.batch_id;batch=None;task=None
+                elif trend_batch.status=='supply_search':
+                    result=json.loads(trend_batch.result_json or '{}')
+                    job=next((x for x in result.get('supply_jobs',[]) if x.get('status')=='queued'),None)
+                    if job:
+                        lease=secrets.token_urlsafe(24);job.update(status='opening',lease=lease,dispatched_at=time.time())
+                        trend_batch.result_json=dump(result);trend_batch.updated_at=utcnow()
+                        command={'type':'trend_supply_image' if job['method']=='image' else 'trend_supply_search',
+                            'batch_id':trend_batch.batch_id,'job_id':job['job_id'],'trend_id':job['trend_id'],'lease':lease,
+                            'page_url':job['page_url'],'keyword':job['keyword'],'max_candidates':30}
+                        if job['method']=='image':command['reference_url']=f"http://127.0.0.1:8010/api/trend-discovery/covers/{trend_batch.batch_id}/{job['job_id']}/{job['reference_token']}"
+                        task_id=job['job_id'];batch=None;task=None
+                    else:command=None;task_id=None;batch=None;task=None
+                else:
+                    command=None;task_id=None;batch=None;task=None
+            else:
+                command=None;task_id=None
             batch=s.scalar(select(BatchSelection).where(BatchSelection.helper_id==helper_id,
                 BatchSelection.status=='search_queued').order_by(BatchSelection.created_at))
-            if batch:
-                data=json.loads(batch.payload);data.update(lease=secrets.token_urlsafe(24),dispatched_at=time.time(),
-                    phase='opening_search',message='正在打开1688搜索页')
+            if trend_batch and command:
+                pass
+            elif batch:
+                data=json.loads(batch.payload);is_image=data.get('search_kind')=='image';data.update(lease=secrets.token_urlsafe(24),dispatched_at=time.time(),
+                    phase='opening_search',message='正在打开1688以图搜图页面' if is_image else '正在打开1688搜索页')
                 batch.payload=dump(data);batch.status='opening_search';batch.updated_at=utcnow()
-                command=dict(type='search',batch_id=batch.batch_id,lease=data['lease'],page_url=data['search_url'],
+                command=dict(type='image_search' if is_image else 'search',batch_id=batch.batch_id,lease=data['lease'],
+                             page_url=data.get('search_url','https://s.1688.com/selloffer/offer_search.htm'),
                              keyword=batch.normalized_keyword,max_candidates=batch.max_candidates)
+                if is_image:
+                    command['reference_url']=f"http://127.0.0.1:8010/api/batch-selection/images/{batch.batch_id}/{data['reference_image']['token']}"
                 task_id=batch.batch_id
                 task=None
-            else:
+            elif not trend_batch:
                 command=None
             task = s.scalar(select(CollectorTask).where(CollectorTask.helper_id == helper_id, CollectorTask.status == "queued")
                             .order_by(CollectorTask.created_at, CollectorTask.task_id))
-            if batch:
+            if trend_batch and command:
+                pass
+            elif batch:
                 pass
             elif not task:
                 return
@@ -335,7 +469,7 @@ class CollectorBridge:
                                        offer_id=task.offer_id,mode=data.get('mode','full'))
                     task.payload = dump(data);task.updated_at = utcnow()
         if task_id is None:
-            await self.dispatch(helper_id);return
+            return
         if command:
             try:
                 await ws.send_json(command)
@@ -365,12 +499,140 @@ class CollectorBridge:
                 raise ValueError('批量调度已失效')
             return row,data
 
+    async def finish_trend_platform_stage(self,batch_id,helper_id):
+        """收口平台采集；即使最后一个平台失败，也继续用已保存证据评分。"""
+        from .trend_discovery import finalize_batch
+        from .trend_supply import queue_supply_jobs
+        result=await asyncio.to_thread(finalize_batch,self.root,batch_id)
+        supply_jobs=queue_supply_jobs(self.root,batch_id)
+        with self.guard,session_scope(self.root) as s:
+            batch=s.get(TrendDiscoveryBatch,batch_id)
+            if batch:
+                progress=json.loads(batch.progress_json)
+                progress.update(scored=result['candidate_count'],qualified=result['qualified_count'])
+                if not supply_jobs:progress.update(stage='completed',message='爆款评分完成；没有可执行的平替搜索任务')
+                batch.progress_json=dump(progress);batch.updated_at=utcnow()
+        await self.dispatch(helper_id)
+
+    async def finish_trend_supply_stage(self,batch_id,helper_id):
+        """收口平替检索；失败任务保留原因，成功任务仍进入评分。"""
+        from .trend_supply import finalize_supply
+        await asyncio.to_thread(finalize_supply,self.root,batch_id)
+        await self.dispatch(helper_id)
+
     async def message(self, helper_id, message):
         if not isinstance(message, dict):
             raise ValueError("消息格式无效")
         action = message.get("type")
+        if action in {'listing_progress','listing_result'}:
+            task_id=str(message.get('task_id',''))
+            with self.guard,session_scope(self.root) as s:
+                task=s.get(DistributionTask,task_id)
+                if not task or task.helper_id!=helper_id:raise ValueError('铺货任务不属于当前助手')
+                values=json.loads(task.payload or '{}')
+                if not secrets.compare_digest(str(message.get('lease','')),str(values.get('lease','!'))):
+                    raise ValueError('铺货调度已失效')
+                if task.status in {'cancelled','completed','failed','interrupted'}:
+                    return {'type':action+'_ack','task_id':task_id,'ignored':True}
+                if action=='listing_progress':
+                    stage=str(message.get('stage',''))
+                    if stage not in {'opening','filling','waiting_user'}:raise ValueError('未知铺货阶段')
+                    error=str(message.get('error_type') or '')
+                    messages={'opening':'正在打开千牛卖家中心','filling':'正在填写可安全识别的草稿字段',
+                              'waiting_user':'请在Chrome/Edge完成登录或进入商品发布页后重试'}
+                    task.status=stage;values.update(message=messages[stage],error_type=error or None)
+                else:
+                    filled=message.get('filled') or [];warnings=message.get('warnings') or []
+                    if not isinstance(filled,list) or not isinstance(warnings,list) or len(filled)>20 or len(warnings)>20:
+                        raise ValueError('铺货结果格式无效')
+                    values.update(filled=[str(x)[:100] for x in filled],warnings=[str(x)[:300] for x in warnings],
+                        current_url=str(message.get('current_url') or '')[:2000],
+                        message='已完成安全字段填写，请核对类目、SKU、价格、库存、运费和资质后由你发布。')
+                    task.status='completed'
+                task.payload=dump(values);task.updated_at=utcnow()
+            return {'type':action+'_ack','task_id':task_id}
+        if action in {'trend_supply_progress','trend_supply_snapshot'}:
+            batch_id=str(message.get('batch_id',''));job_id=str(message.get('job_id',''))
+            with self.guard,session_scope(self.root) as s:
+                batch=s.get(TrendDiscoveryBatch,batch_id)
+                if not batch or batch.helper_id!=helper_id:raise ValueError('平替任务不属于当前助手')
+                result=json.loads(batch.result_json or '{}');job=next((x for x in result.get('supply_jobs',[]) if x.get('job_id')==job_id),None)
+                if not job or not secrets.compare_digest(str(message.get('lease','')),str(job.get('lease','!'))):raise ValueError('平替调度已失效')
+                if action=='trend_supply_progress':
+                    stage=str(message.get('stage',''));error=str(message.get('error_type') or '')
+                    if stage not in {'opening','reading','waiting_user','failed'}:raise ValueError('未知平替搜索阶段')
+                    job.update(status=stage,error_type=error,message=ERRORS.get(error,'浏览器正在读取1688平替结果。'))
+                    if stage in {'waiting_user','failed'}:batch.status='supply_search'
+                    batch.result_json=dump(result);batch.updated_at=utcnow()
+                    finished=stage=='failed' and all(x.get('status') in {'completed','failed'} for x in result.get('supply_jobs',[]))
+                    if finished:asyncio.create_task(self.finish_trend_supply_stage(batch_id,helper_id))
+                    elif stage in {'waiting_user','failed'}:asyncio.create_task(self.dispatch(helper_id))
+                    return {'type':'trend_supply_progress_ack','batch_id':batch_id,'job_id':job_id}
+                try:snapshot=SearchEvidence.model_validate(message.get('snapshot')).model_dump()
+                except ValidationError:raise ValueError('平替搜索快照结构无效') from None
+                parsed=urlsplit(snapshot['page_url'])
+                if parsed.scheme!='https' or parsed.hostname!='s.1688.com':raise ValueError('平替搜索快照来源无效')
+                from .trend_supply import save_supply_snapshot
+                done=save_supply_snapshot(self.root,batch_id,job_id,snapshot['candidates'])
+            if done:
+                from .trend_supply import finalize_supply
+                await asyncio.to_thread(finalize_supply,self.root,batch_id)
+            await self.dispatch(helper_id)
+            return {'type':'trend_supply_snapshot_ack','batch_id':batch_id,'job_id':job_id,'completed':done}
+        if action in {'trend_search_progress','trend_search_snapshot'}:
+            batch_id=str(message.get('batch_id',''));platform=str(message.get('platform',''))
+            if platform not in {'taobao','jd','douyin'}:raise ValueError('未知爆款平台')
+            with self.guard,session_scope(self.root) as s:
+                batch=s.get(TrendDiscoveryBatch,batch_id)
+                if not batch or batch.helper_id!=helper_id:raise ValueError('爆款任务不属于当前助手')
+                progress=json.loads(batch.progress_json);state=progress.get('platforms',{}).get(platform)
+                if not state or not secrets.compare_digest(str(message.get('lease','')),str(state.get('lease','!'))):
+                    raise ValueError('爆款调度已失效')
+                if action=='trend_search_progress':
+                    stage=str(message.get('stage',''))
+                    if stage not in {'opening','reading','waiting_user','failed'}:raise ValueError('未知爆款采集阶段')
+                    error=str(message.get('error_type') or '')
+                    state.update(status=stage,error_type=error,message=ERRORS.get(error,'浏览器正在读取平台可见商品。'),
+                        dispatched_at=time.time())
+                    if message.get('found') is not None:state['found']=max(0,min(20,int(message.get('found') or 0)))
+                    if message.get('detail_completed') is not None:
+                        state['detail_completed']=max(0,min(20,int(message.get('detail_completed') or 0)))
+                    if stage=='waiting_user' and platform=='douyin' and state.get('surface')=='buyin' and error in {'login_required','verification_required','page_changed'}:
+                        state.update(status='queued',surface='public',lease='',message='百应不可用，已自动切换抖音公开商品搜索')
+                        batch.status='collecting'
+                    elif stage=='waiting_user': batch.status='collecting'
+                    batch.progress_json=dump(progress);batch.updated_at=utcnow()
+                    finished=stage=='failed' and all(x.get('status') in {'completed','failed'} for x in progress.get('platforms',{}).values())
+                    if finished:asyncio.create_task(self.finish_trend_platform_stage(batch_id,helper_id))
+                    elif stage in {'waiting_user','failed'}:asyncio.create_task(self.dispatch(helper_id))
+                    return {'type':'trend_search_progress_ack','batch_id':batch_id}
+                snapshot=message.get('snapshot')
+                if not isinstance(snapshot,dict) or snapshot.get('platform')!=platform:raise ValueError('平台快照结构无效')
+                records=snapshot.get('candidates')
+                if not isinstance(records,list) or len(records)>20:raise ValueError('平台候选超过20条或格式无效')
+                if any(not isinstance(x,dict) or len(dump(x))>12000 for x in records):raise ValueError('平台候选证据无效')
+                from .trend_discovery import save_sources
+                count=save_sources(self.root,batch_id,platform,records)
+                detail_count=sum(str(x.get('detail_status','')).startswith('已读取') for x in records)
+                state.update(status='completed',found=count,detail_completed=detail_count,
+                    message=f'已保存{count}条页面证据，详情补充{detail_count}条',lease='')
+                batch.status='collecting';progress['message']='正在继续下一个平台';batch.progress_json=dump(progress);batch.updated_at=utcnow()
+                complete=all(x.get('status') in {'completed','failed'} for x in progress.get('platforms',{}).values())
+            if complete:
+                from .trend_discovery import finalize_batch
+                result=finalize_batch(self.root,batch_id)
+                from .trend_supply import queue_supply_jobs
+                supply_jobs=queue_supply_jobs(self.root,batch_id)
+                with session_scope(self.root) as s:
+                    batch=s.get(TrendDiscoveryBatch,batch_id);progress=json.loads(batch.progress_json)
+                    progress.update(scored=result['candidate_count'],qualified=result['qualified_count'])
+                    if not supply_jobs:progress.update(stage='completed',message='爆款评分完成；没有可执行的平替搜索任务')
+                    batch.progress_json=dump(progress);batch.updated_at=utcnow()
+            await self.dispatch(helper_id)
+            return {'type':'trend_search_snapshot_ack','batch_id':batch_id,'found':count,'completed':complete}
         if action == "heartbeat":
             batch_timeouts=[]
+            trend_platform_done=[];trend_supply_done=[]
             with session_scope(self.root) as s:
                 s.get(CollectorHelper, helper_id).last_seen = utcnow()
                 now=time.time()
@@ -421,8 +683,32 @@ class CollectorBridge:
                         stale.status='waiting_user';values.update(phase='waiting_user',error_type='capture_timeout',
                             message='搜索页读取超时，请在Chrome/Edge检查页面后继续。')
                         stale.payload=dump(values);stale.updated_at=utcnow()
+                # 平台和1688搜索使用同一串行助手，任何页面卡住都必须释放租约并继续后续任务。
+                for batch in s.scalars(select(TrendDiscoveryBatch).where(
+                        TrendDiscoveryBatch.helper_id==helper_id,
+                        TrendDiscoveryBatch.status.in_({'collecting','supply_search'}))):
+                    progress=json.loads(batch.progress_json);result=json.loads(batch.result_json or '{}');changed=False
+                    for state in progress.get('platforms',{}).values():
+                        if state.get('status') in {'opening','reading'} and now-float(state.get('dispatched_at',now))>180:
+                            state.update(status='failed',lease='',error_type='capture_timeout',
+                                message='平台页面读取超时，已跳过并继续其他平台。');changed=True
+                    for job in result.get('supply_jobs',[]):
+                        if job.get('status') in {'opening','reading'} and now-float(job.get('dispatched_at',now))>180:
+                            job.update(status='failed',lease='',error_type='capture_timeout',
+                                message='1688搜索页读取超时，已跳过并继续其他任务。');changed=True
+                    if changed:
+                        batch.progress_json=dump(progress);batch.result_json=dump(result);batch.updated_at=utcnow()
+                    platforms=progress.get('platforms',{})
+                    if platforms and all(x.get('status') in {'completed','failed'} for x in platforms.values()):
+                        if not result.get('supply_jobs') and batch.status=='collecting':trend_platform_done.append(batch.batch_id)
+                    jobs=result.get('supply_jobs',[])
+                    if jobs and all(x.get('status') in {'completed','failed'} for x in jobs):trend_supply_done.append(batch.batch_id)
             for batch_id,task_id in batch_timeouts:
                 await self.finish_batch_item(batch_id,task_id,None,None,'capture_timeout')
+            for batch_id in dict.fromkeys(trend_platform_done):
+                await self.finish_trend_platform_stage(batch_id,helper_id)
+            for batch_id in dict.fromkeys(trend_supply_done):
+                await self.finish_trend_supply_stage(batch_id,helper_id)
             await self.dispatch(helper_id)
             return {"type": "heartbeat"}
         if action in {'search_progress','search_snapshot'}:
@@ -435,7 +721,7 @@ class CollectorBridge:
                     self.change_batch(batch.batch_id,stage,phase=stage,error_type=error,
                         waiting_scope='search' if stage=='waiting_user' else None,
                         auto_retry_at=time.time()+8 if stage=='waiting_user' else None,
-                        message=ERRORS.get(error,'浏览器正在读取1688搜索结果。'))
+                        message=ERRORS.get(error,'浏览器正在读取1688以图搜图结果。' if data.get('search_kind')=='image' else '浏览器正在读取1688搜索结果。'))
                     return {'type':'search_progress_ack','batch_id':batch.batch_id}
                 try:snapshot=SearchEvidence.model_validate(message.get('snapshot')).model_dump()
                 except ValidationError:raise ValueError('搜索快照结构无效') from None
@@ -689,8 +975,13 @@ class CollectorBridge:
                             await self.finish_batch_item(batch_id,task_id,run_id,None,'filtered_out');return
                     from .collector import auto_enroll_run
                     enrolled=await asyncio.to_thread(auto_enroll_run,self.root,run_id)
+                    from .workbench import capture_cover
+                    try:
+                        await asyncio.to_thread(capture_cover,self.root,enrolled['product_id'],snapshot)
+                    except Exception:
+                        pass  # A list-only cover must never block text intake or scoring.
                     self.change(task_id,'completed',model_status='rules',found=len(snapshot.get('images',[])),
-                        downloaded=0,failed=0,message='文字、SKU和图片引用已保存；本阶段未下载或分析图片。')
+                        downloaded=0,failed=0,message='文字与SKU已保存，已尝试保存一张列表封面；完整素材将在选品后采集。')
                     if batch_id:await self.finish_batch_item(batch_id,task_id,run_id,enrolled['product_id'])
                 except Exception as exc:
                     self.change(task_id,'failed',error_type=type(exc).__name__,message='文字资料不满足自动入池条件。')
@@ -910,6 +1201,58 @@ class CollectorBridge:
             result=await self.submit(url,'assets');results.append({'product_id':product_id,**result})
         return {'items':results}
 
+    def read_distribution(self, task_id):
+        with session_scope(self.root) as s:
+            task=s.get(DistributionTask,task_id)
+            if not task:raise HTTPException(404,'铺货任务不存在')
+            values=json.loads(task.payload or '{}')
+            return {'task_id':task.task_id,'package_id':task.package_id,'platform':task.platform,
+                'status':task.status,'message':values.get('message',''),'filled':values.get('filled',[]),
+                'warnings':values.get('warnings',[]),'current_url':values.get('current_url'),
+                'error_type':values.get('error_type'),'created_at':task.created_at,'updated_at':task.updated_at}
+
+    async def submit_distribution(self, package_id, listing):
+        """把已确认内容包交给扩展；命令只允许打开后台并填草稿文本。"""
+        if listing.get('platform')!='淘宝':raise HTTPException(422,'当前只支持淘宝辅助填写')
+        title=str((listing.get('autofill') or {}).get('title') or '')[:120]
+        description=str((listing.get('autofill') or {}).get('description') or '')[:12000]
+        if not title:raise HTTPException(409,'上架包缺少商品标题')
+        with self.guard,session_scope(self.root) as s:
+            if not s.get(ListingPackage,package_id):raise HTTPException(404,'内容包不存在')
+            helpers=[hid for hid in self.connections if s.get(CollectorHelper,hid).version==VERSION]
+            if not helpers:raise HTTPException(409,f'铺货辅助要求采集助手{VERSION}，请更新扩展并重新连接')
+            helper_id=sorted(helpers)[0]
+            collector_busy=s.scalar(select(CollectorTask).where(CollectorTask.helper_id==helper_id,CollectorTask.status.in_(ACTIVE)))
+            listing_busy=s.scalar(select(DistributionTask).where(DistributionTask.helper_id==helper_id,
+                DistributionTask.status.in_({'opening','filling','waiting_user'})))
+            if collector_busy or listing_busy:raise HTTPException(409,'浏览器助手正在执行其他任务，请完成或取消后再试')
+            task_id='DT-'+uuid.uuid4().hex;lease=secrets.token_urlsafe(24);now=utcnow()
+            values={'lease':lease,'message':'正在打开千牛卖家中心','filled':[],'warnings':[],
+                'dispatched_at':time.time()}
+            s.add(DistributionTask(task_id=task_id,package_id=package_id,helper_id=helper_id,
+                platform='淘宝',status='opening',payload=dump(values),created_at=now,updated_at=now))
+        command={'type':'listing_fill','task_id':task_id,'package_id':package_id,'lease':lease,
+            'platform':'淘宝','page_url':listing['seller_url'],'fields':{'title':title,'description':description}}
+        try:await self.connections[helper_id].send_json(command)
+        except (RuntimeError,WebSocketDisconnect):
+            with session_scope(self.root) as s:
+                row=s.get(DistributionTask,task_id);values=json.loads(row.payload);values.update(error_type='helper_disconnected',message='助手连接中断，请重试')
+                row.status='interrupted';row.payload=dump(values);row.updated_at=utcnow()
+        return self.read_distribution(task_id)
+
+    async def cancel_distribution(self,task_id):
+        with self.guard,session_scope(self.root) as s:
+            row=s.get(DistributionTask,task_id)
+            if not row:raise HTTPException(404,'铺货任务不存在')
+            if row.status in {'completed','failed','cancelled','interrupted'}:return self.read_distribution(task_id)
+            values=json.loads(row.payload);values['message']='已取消辅助填写，卖家后台页面保持打开。'
+            row.status='cancelled';row.payload=dump(values);row.updated_at=utcnow();helper=row.helper_id
+        ws=self.connections.get(helper)
+        if ws:
+            try:await ws.send_json({'type':'cancel','task_id':task_id})
+            except (RuntimeError,WebSocketDisconnect):pass
+        return self.read_distribution(task_id)
+
     async def websocket(self, ws):
         origin = ws.headers.get("origin", "")
         if not extension_origin(origin):
@@ -968,6 +1311,11 @@ class CollectorBridge:
                         data=json.loads(batch.payload);data.update(phase='interrupted',error_type='helper_disconnected',
                             message='助手连接中断；已保存候选保留，可继续任务。')
                         batch.status='interrupted';batch.payload=dump(data);batch.updated_at=utcnow()
+                    for task in s.scalars(select(DistributionTask).where(DistributionTask.helper_id==helper_id,
+                            DistributionTask.status.in_({'opening','filling','waiting_user'}))):
+                        values=json.loads(task.payload or '{}');values.update(error_type='helper_disconnected',
+                            message='助手连接中断；卖家后台不会自动发布，请重新发起辅助填写。')
+                        task.status='interrupted';task.payload=dump(values);task.updated_at=utcnow()
                 # 快照已在本机时，断线不打断独立下载任务。
 
 
@@ -1015,11 +1363,104 @@ def install_collector_bridge(app: FastAPI, root: Path):
         try:return recommend_filters(root,str(payload.get('keyword','')))
         except ValueError as exc:raise HTTPException(422,str(exc)) from None
 
+    @app.post('/api/trend-discovery/plans')
+    def trend_plan(request:Request,payload:dict=Body(...)):
+        local_write(request)
+        from .trend_discovery import suggest_filters
+        try:return suggest_filters(str(payload.get('category','')),root)
+        except ValueError as exc:raise HTTPException(422,str(exc)) from None
+
+    @app.post('/api/trend-discovery/batches',status_code=202)
+    async def trend_start(request:Request,payload:dict=Body(...)):
+        local_write(request)
+        return await bridge.submit_trend_discovery(payload.get('category'),payload.get('filters') or {})
+
+    @app.get('/api/trend-discovery/batches')
+    def trend_batches():
+        with session_scope(root) as s:
+            ids=list(s.scalars(select(TrendDiscoveryBatch.batch_id).order_by(TrendDiscoveryBatch.created_at.desc()).limit(30)))
+        return {'items':[bridge.read_trend_discovery(x) for x in ids]}
+
+    @app.get('/api/trend-discovery/batches/{batch_id}')
+    def trend_batch_get(batch_id:str):return bridge.read_trend_discovery(batch_id)
+
+    @app.get('/api/trend-discovery/covers/{batch_id}/{job_id}/{token}')
+    def trend_reference(batch_id:str,job_id:str,token:str):
+        from .trend_supply import reference_file
+        try:path=reference_file(root,batch_id,job_id,token)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+        return FileResponse(path,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
+
+    @app.post('/api/trend-discovery/batches/{batch_id}/resume')
+    async def trend_batch_resume(batch_id:str,request:Request):
+        local_write(request)
+        with bridge.guard,session_scope(root) as s:
+            batch=s.get(TrendDiscoveryBatch,batch_id)
+            if not batch:raise HTTPException(404,'爆款采集批次不存在')
+            latest=[hid for hid in bridge.connections if s.get(CollectorHelper,hid).version==VERSION]
+            if not latest:raise HTTPException(409,f'爆款采集要求采集助手{VERSION}，请重新加载新版扩展')
+            batch.helper_id=sorted(latest)[0];progress=json.loads(batch.progress_json)
+            for state in progress.get('platforms',{}).values():
+                if state.get('status') in {'opening','reading','waiting_user','failed'}:state.update(status='queued',lease='')
+            result=json.loads(batch.result_json or '{}');supply=False
+            for job in result.get('supply_jobs',[]):
+                if job.get('status') in {'opening','reading','waiting_user','failed'}:job.update(status='queued',lease='');supply=True
+                elif job.get('status')=='queued':supply=True
+            batch.result_json=dump(result);batch.status='supply_search' if supply else 'queued';progress['message']='已继续未完成任务';batch.progress_json=dump(progress);batch.updated_at=utcnow();helper=batch.helper_id
+        await bridge.dispatch(helper);return bridge.read_trend_discovery(batch_id)
+
+    @app.post('/api/trend-discovery/batches/{batch_id}/pause')
+    async def trend_batch_pause(batch_id:str,request:Request):
+        local_write(request)
+        with bridge.guard,session_scope(root) as s:
+            batch=s.get(TrendDiscoveryBatch,batch_id)
+            if not batch:raise HTTPException(404,'爆款采集批次不存在')
+            if batch.status in {'completed','partial','failed','cancelled','完成','部分完成'}:
+                raise HTTPException(409,'当前任务已结束，不能暂停')
+            progress=json.loads(batch.progress_json)
+            for state in progress.get('platforms',{}).values():
+                if state.get('status') in {'opening','reading'}:state.update(status='queued',lease='')
+            result=json.loads(batch.result_json or '{}')
+            for job in result.get('supply_jobs',[]):
+                if job.get('status') in {'opening','reading'}:job.update(status='queued',lease='')
+            progress.update(stage='paused',message='已暂停；页面证据与评分结果均已保留')
+            batch.progress_json=dump(progress);batch.result_json=dump(result);batch.status='paused';batch.updated_at=utcnow()
+        return bridge.read_trend_discovery(batch_id)
+
+    @app.post('/api/trend-discovery/batches/{batch_id}/cancel')
+    async def trend_batch_cancel(batch_id:str,request:Request):
+        local_write(request)
+        with bridge.guard,session_scope(root) as s:
+            batch=s.get(TrendDiscoveryBatch,batch_id)
+            if not batch:raise HTTPException(404,'爆款采集批次不存在')
+            batch.status='cancelled';progress=json.loads(batch.progress_json);progress.update(stage='cancelled',message='已取消')
+            batch.progress_json=dump(progress);batch.updated_at=utcnow()
+        return bridge.read_trend_discovery(batch_id)
+
     @app.post('/api/batch-selection',status_code=202)
     async def batch_start(request:Request,payload:dict=Body(...)):
         local_write(request)
         return await bridge.submit_batch(payload.get('original_keyword'),payload.get('normalized_keyword'),
             payload.get('filters') or {},payload.get('target_count',20),payload.get('max_candidates',60))
+
+    @app.post('/api/batch-selection/image',status_code=202)
+    async def image_batch_start(request:Request,payload:dict=Body(...)):
+        local_write(request)
+        return await bridge.submit_image_batch(payload.get('original_keyword'),payload.get('filters') or {},
+            payload.get('image_base64'),payload.get('mime_type'),payload.get('target_count',20),payload.get('max_candidates',60))
+
+    @app.get('/api/batch-selection/images/{batch_id}/{token}')
+    def image_batch_reference(batch_id:str,token:str):
+        """仅供已下发任务的本机扩展读取用户选择的参考图；不暴露目录浏览。"""
+        with session_scope(root) as s:
+            batch=s.get(BatchSelection,batch_id)
+            if not batch:raise HTTPException(404,'参考图不存在')
+            image=json.loads(batch.payload).get('reference_image',{})
+        if not image or not secrets.compare_digest(str(token),str(image.get('token',''))):
+            raise HTTPException(404,'参考图不存在')
+        path=(root/str(image.get('path',''))).resolve();allowed=(root/'data'/'image-search').resolve()
+        if allowed not in path.parents or not path.is_file():raise HTTPException(404,'参考图文件不存在')
+        return FileResponse(path,media_type=str(image.get('mime_type','application/octet-stream')),headers={'Cache-Control':'no-store'})
 
     @app.get('/api/batch-selection')
     def batch_list():
@@ -1066,7 +1507,7 @@ def install_collector_bridge(app: FastAPI, root: Path):
     def extension_zip():
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name in ["manifest.json", "background.js", "capture.js", "search_capture.js", "popup.html", "popup.js", "README.md"]:
+            for name in ["manifest.json", "background.js", "capture.js", "search_capture.js", "image_search.js", "trend_search_capture.js", "listing_fill.js", "popup.html", "popup.js", "README.md"]:
                 archive.write(root/"extension"/name, "pintan-collector/"+name)
         return Response(buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition":"attachment; filename=pintan-collector.zip"})
 

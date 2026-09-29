@@ -54,8 +54,10 @@ window.pintanSearchCapture=async function(keyword,maxCandidates=60){
     const priceMatch=text.match(/(?:¥|￥|价格\s*)\s*([0-9]+(?:\.[0-9]+)?)/);
     const salesMatch=text.match(/(?:已售|成交|付款)\s*([^\s]{1,20})/);
     const moqMatch=text.match(/([0-9]+\s*(?:件|个|套|包|箱)\s*起(?:批|订)?)/);
+    const coverUrl=image?.currentSrc||image?.src||image?.getAttribute?.('data-src')||image?.getAttribute?.('data-lazy-src')||'';
     seen.set(id,{page_url:normalizeUrl(id),title,price:priceMatch?Number(priceMatch[1]):null,
       sales_text:salesMatch?.[0]||'',moq_text:moqMatch?.[1]||'',
+      cover_url:String(coverUrl).slice(0,2000),
       is_ad:/广告|推广|hotad|p4p/i.test(text+' '+String(card?.className||'')),
       relevance_rank:seen.size+1,discovery_method:method});
   };

@@ -1,10 +1,18 @@
 {
   "manifest_version": 3,
   "name": "品探1688采集助手",
-  "version": "2.4.4",
+  "version": "2.7.0",
   "minimum_chrome_version": "120",
-  "permissions": ["scripting", "storage", "alarms"],
-  "host_permissions": ["https://detail.1688.com/*", "https://s.1688.com/*", "http://127.0.0.1:8010/*"],
+  "permissions": ["scripting", "storage", "alarms", "tabs"],
+  "host_permissions": [
+    "https://detail.1688.com/*", "https://s.1688.com/*",
+    "https://s.taobao.com/*", "https://item.taobao.com/*", "https://detail.tmall.com/*",
+    "https://search.jd.com/*", "https://item.jd.com/*",
+    "https://www.douyin.com/*", "https://haohuo.jinritemai.com/*", "https://buyin.jinritemai.com/*",
+    "https://myseller.taobao.com/*", "https://item.upload.taobao.com/*", "https://qn.taobao.com/*",
+    "https://sell.jd.com/*", "https://fxg.jinritemai.com/*",
+    "http://127.0.0.1:8010/*"
+  ],
   "background": {"service_worker": "background.js"},
   "action": {"default_popup": "popup.html"}
 }

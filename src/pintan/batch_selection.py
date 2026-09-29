@@ -194,15 +194,21 @@ def batch_view(root, batch_id: str) -> dict[str, Any]:
                                 ('rejected' if scoring.get('promotion_status')=='rejected' else 'needs_input'))
             item_views.append({"offer_id":item.offer_id,"title":item.title,"page_url":item.page_url,
                 "relevance_rank":item.relevance_rank,"status":display_status,
+                "wholesale_price_cny":scoring.get('wholesale_price_cny', values.get('price','')),
                 "collector_task_id":item.collector_task_id,"product_id":item.product_id,
                 "run_id":run_id,"error_type":item.error_type,
                 "promotion_status":scoring.get('promotion_status'),"total_score":scoring.get('total_score',''),
                 "profit_score":scoring.get('profit_score',''),"market_validation_score":scoring.get('market_validation_score',''),
                 "operating_fit_score":scoring.get('operating_fit_score',''),
                 "missing_score_fields":scoring.get('missing_score_fields',''),**values})
+        from .workbench import with_covers
+        with_covers(root, item_views)
         return {
             "batch_id": batch.batch_id, "original_keyword": batch.original_keyword,
             "normalized_keyword": batch.normalized_keyword, "filters": json.loads(batch.filters_json),
+            "search_kind": payload.get("search_kind", "keyword"),
+            "reference_image": ({k:v for k,v in payload.get("reference_image",{}).items() if k not in {"path","token"}}
+                                or None),
             "target_count": batch.target_count, "max_candidates": batch.max_candidates,
             "status": batch.status, "phase": payload.get("phase", batch.status),
             "message": payload.get("message", ""), "found": payload.get("found", 0),

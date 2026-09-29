@@ -52,7 +52,7 @@
     }
   }
   async function poll(){
-    if(polling||!current||stopped||location.hash!=='#collector')return;
+    if(polling||!current||stopped||!['#collector','#collector/batch'].includes(location.hash))return;
     clearTimeout(timer);polling=true;const id=current;
     try{
       const task=await api('/api/collector/tasks/'+encodeURIComponent(id));
@@ -86,10 +86,10 @@
   $('autoCollectRefresh').onclick=()=>list().catch(error);
   async function enter(){
     clearTimeout(timer);clearTimeout(bridgeTimer);
-    if(location.hash!=='#collector')return;
+    if(!['#collector','#collector/batch'].includes(location.hash))return;
     try{await checkBridge();await list();}catch(e){error(e);}
     async function connectionLoop(){
-      if(location.hash!=='#collector')return;
+      if(!['#collector','#collector/batch'].includes(location.hash))return;
       try{await checkBridge();bridgeTimer=setTimeout(connectionLoop,5000);}catch(e){error(e);}
     }
     bridgeTimer=setTimeout(connectionLoop,5000);

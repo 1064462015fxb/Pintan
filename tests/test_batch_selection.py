@@ -2,6 +2,8 @@ import tempfile
 import unittest
 import json
 import time
+import base64
+import io
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import unquote_to_bytes, urlsplit
@@ -39,6 +41,19 @@ class BatchSelectionTests(unittest.TestCase):
               {'page_url':'https://detail.1688.com/offer/2.html','title':'加盟教程','relevance_rank':3},
               {'page_url':'https://evil.test/offer/3.html','title':'危险','relevance_rank':4}]
         result=filter_candidates(rows,advice,60);self.assertEqual([x['offer_id'] for x in result],['1'])
+
+    def test_image_search_batch_stores_local_reference_and_dispatches_image_command(self):
+        from PIL import Image
+        image=Image.new('RGB',(40,40),(42,120,80));buffer=io.BytesIO();image.save(buffer,format='PNG')
+        response=self.client.post('/api/batch-selection/image',headers=LOCAL,json={
+            'original_keyword':'参考椅子','filters':{},'image_base64':base64.b64encode(buffer.getvalue()).decode(),
+            'mime_type':'image/png','target_count':2,'max_candidates':3})
+        self.assertEqual(response.status_code,202,response.text);batch_id=response.json()['batch_id']
+        command=self.ws.receive_json();self.assertEqual(command['type'],'image_search')
+        self.assertEqual(command['batch_id'],batch_id);self.assertIn('/api/batch-selection/images/',command['reference_url'])
+        view=self.client.get(f'/api/batch-selection/{batch_id}').json()
+        self.assertEqual(view['search_kind'],'image');self.assertEqual(view['reference_image']['source'],'用户上传')
+        reference=self.client.get(command['reference_url']);self.assertEqual(reference.status_code,200);self.assertEqual(reference.headers['content-type'],'image/png')
 
     def test_text_snapshot_auto_enrolls_without_downloading(self):
         from pintan.collector import auto_enroll_run,collect_snapshot

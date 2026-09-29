@@ -9,7 +9,7 @@ from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text, Unique
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 11
 BUSINESS = {"pintan_stable_products.csv": ("stable", "stable_id"), "pintan_market_trending_products.csv": ("trend", "trend_id"), "pintan_trend_search_results.csv": ("search", "search_id")}
 
 class Base(DeclarativeBase): pass
@@ -27,6 +27,68 @@ class StableScore(Base):
     __tablename__="stable_scores"; product_id:Mapped[str]=mapped_column(ForeignKey("products.product_id"),primary_key=True); payload:Mapped[str]=mapped_column(Text)
 class TrendMatch(Base):
     __tablename__="trend_matches"; search_id:Mapped[str]=mapped_column(ForeignKey("search_candidates.search_id"),primary_key=True); payload:Mapped[str]=mapped_column(Text)
+class TrendDiscoveryBatch(Base):
+    """一次淘宝/京东/抖音爆款发现任务。筛选条件和阶段进度均保留。"""
+    __tablename__="trend_discovery_batches"
+    batch_id:Mapped[str]=mapped_column(String,primary_key=True)
+    helper_id:Mapped[str|None]=mapped_column(String,nullable=True,index=True)
+    category:Mapped[str]=mapped_column(String,index=True)
+    status:Mapped[str]=mapped_column(String,index=True)
+    filters_json:Mapped[str]=mapped_column(Text,default="{}")
+    progress_json:Mapped[str]=mapped_column(Text,default="{}")
+    result_json:Mapped[str]=mapped_column(Text,default="{}")
+    error_type:Mapped[str|None]=mapped_column(String,nullable=True)
+    created_at:Mapped[str]=mapped_column(String)
+    updated_at:Mapped[str]=mapped_column(String)
+class TrendDiscoverySource(Base):
+    """平台页面可见证据。数值下限与原文同时写入 payload。"""
+    __tablename__="trend_discovery_sources"
+    source_id:Mapped[str]=mapped_column(String,primary_key=True)
+    batch_id:Mapped[str]=mapped_column(ForeignKey("trend_discovery_batches.batch_id"),index=True)
+    platform:Mapped[str]=mapped_column(String,index=True)
+    product_key:Mapped[str]=mapped_column(String,index=True)
+    page_url:Mapped[str]=mapped_column(Text)
+    status:Mapped[str]=mapped_column(String,index=True)
+    payload:Mapped[str]=mapped_column(Text,default="{}")
+    __table_args__=(UniqueConstraint("batch_id","platform","product_key"),)
+class TrendDiscoveryCandidate(Base):
+    """跨平台合并后的爆款候选及可审计评分。"""
+    __tablename__="trend_discovery_candidates"
+    candidate_id:Mapped[str]=mapped_column(String,primary_key=True)
+    batch_id:Mapped[str]=mapped_column(ForeignKey("trend_discovery_batches.batch_id"),index=True)
+    trend_id:Mapped[str|None]=mapped_column(String,nullable=True,index=True)
+    status:Mapped[str]=mapped_column(String,index=True)
+    score:Mapped[float]=mapped_column(Float,default=0)
+    evidence_coverage:Mapped[float]=mapped_column(Float,default=0)
+    payload:Mapped[str]=mapped_column(Text,default="{}")
+class ProductCover(Base):
+    """列表封面独立保存，不代表内容素材或使用授权。"""
+    __tablename__ = 'product_covers'
+    product_id:Mapped[str]=mapped_column(ForeignKey('products.product_id'),primary_key=True)
+    payload:Mapped[str]=mapped_column(Text,default='{}')
+
+class ListingPackage(Base):
+    """用户确认的发布材料快照，后续生成不覆盖已确认版本。"""
+    __tablename__ = 'listing_packages'
+    package_id:Mapped[str]=mapped_column(String,primary_key=True)
+    product_id:Mapped[str]=mapped_column(ForeignKey('products.product_id'),index=True)
+    content_id:Mapped[str]=mapped_column(ForeignKey('platform_contents.content_id'),index=True)
+    fingerprint:Mapped[str]=mapped_column(String,unique=True)
+    payload:Mapped[str]=mapped_column(Text)
+    created_at:Mapped[str]=mapped_column(String)
+
+class DistributionTask(Base):
+    """一次卖家后台辅助填写任务；只填草稿字段，绝不代替用户发布。"""
+    __tablename__ = 'distribution_tasks'
+    task_id:Mapped[str]=mapped_column(String,primary_key=True)
+    package_id:Mapped[str]=mapped_column(ForeignKey('listing_packages.package_id'),index=True)
+    helper_id:Mapped[str|None]=mapped_column(ForeignKey('collector_helpers.helper_id'),nullable=True,index=True)
+    platform:Mapped[str]=mapped_column(String,index=True)
+    status:Mapped[str]=mapped_column(String,index=True)
+    payload:Mapped[str]=mapped_column(Text,default='{}')
+    created_at:Mapped[str]=mapped_column(String)
+    updated_at:Mapped[str]=mapped_column(String)
+
 class ProductAsset(Base):
     __tablename__="product_assets"; asset_id:Mapped[str]=mapped_column(String,primary_key=True); product_id:Mapped[str]=mapped_column(ForeignKey("products.product_id")); asset_type:Mapped[str]=mapped_column(String); status:Mapped[str]=mapped_column(String,default="待采集"); source_url:Mapped[str|None]=mapped_column(Text,nullable=True); local_path:Mapped[str|None]=mapped_column(Text,nullable=True); cutout_path:Mapped[str|None]=mapped_column(Text,nullable=True); sha256:Mapped[str|None]=mapped_column(String,nullable=True); mime_type:Mapped[str|None]=mapped_column(String,nullable=True); byte_size:Mapped[int|None]=mapped_column(Integer,nullable=True); width:Mapped[int|None]=mapped_column(Integer,nullable=True); height:Mapped[int|None]=mapped_column(Integer,nullable=True); collected_at:Mapped[str|None]=mapped_column(String,nullable=True); ocr_text:Mapped[str|None]=mapped_column(Text,nullable=True); authorization_status:Mapped[str|None]=mapped_column(String,nullable=True)
 class AssetCaptureMeta(Base):
@@ -52,6 +114,17 @@ class ImagePlan(Base):
     input_hash:Mapped[str]=mapped_column(String)
     payload:Mapped[str]=mapped_column(Text)
     created_at:Mapped[str]=mapped_column(String)
+
+class VideoPlan(Base):
+    """15秒短视频分镜；镜头生成失败时保留规划并允许局部重试。"""
+    __tablename__='video_plans'
+    plan_id:Mapped[str]=mapped_column(String,primary_key=True)
+    content_id:Mapped[str]=mapped_column(ForeignKey('platform_contents.content_id'),index=True)
+    input_hash:Mapped[str]=mapped_column(String)
+    status:Mapped[str]=mapped_column(String,index=True)
+    payload:Mapped[str]=mapped_column(Text)
+    created_at:Mapped[str]=mapped_column(String)
+    updated_at:Mapped[str]=mapped_column(String)
 
 class ImageReview(Base):
     """逐轮生成结果和独立视觉审核；最多三轮，不覆盖失败证据。"""

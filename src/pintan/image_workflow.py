@@ -873,25 +873,28 @@ def generate_planned(root,content_id,slots=None,*,replan=False,avoid_asset_ids=N
     单图返工仍保持串行；整组任务默认同时处理2张，避免10张图片的生成和
     审核完全串行，也避免一次向模型端点压入过多请求触发限流。
     """
+    if progress_callback:
+        import inspect
+        callback = progress_callback
+        try:
+            inspect.signature(callback).bind(0, 0, 0, 0, 0)
+        except TypeError:
+            progress_callback = lambda done, total, workers, success, failed: callback(done, total, workers)
     if parent_media_id or (slots and len(slots)<=1):
         result=_generate_planned_serial(root,content_id,slots,replan=replan,
             avoid_asset_ids=avoid_asset_ids,audit_level=audit_level,
             generation_mode=generation_mode,slot_modes=slot_modes,
             user_feedback=user_feedback,parent_media_id=parent_media_id)
-        if progress_callback:progress_callback(len(result['items']),len(result['items']),1)
+        if progress_callback:progress_callback(len(result['items']),len(result['items']),1,sum(x['status']=='success' for x in result['items']),sum(x['status']!='success' for x in result['items']))
         return result
     plan=plan_images(root,content_id,force=replan,excluded_asset_ids=avoid_asset_ids)
     labels=[f"{x['section']}-{x['index']}" for x in plan['slots']]
     if slots:labels=[x for x in labels if x in set(slots)]
     workers=max(1,min(4,int(os.getenv('PINTAN_IMAGE_WORKERS','2'))))
-    if len(labels)<=1 or workers==1:
-        return _generate_planned_serial(root,content_id,labels,replan=False,
-            avoid_asset_ids=avoid_asset_ids,audit_level=audit_level,
-            generation_mode=generation_mode,slot_modes=slot_modes,
-            user_feedback=user_feedback)
     completed={}
     active_workers=min(workers,len(labels))
-    if progress_callback:progress_callback(0,len(labels),active_workers)
+    if not labels:raise ValueError('当前没有可生成的图片规划')
+    if progress_callback:progress_callback(0,len(labels),active_workers,0,0)
     with ThreadPoolExecutor(max_workers=active_workers,thread_name_prefix='pintan-image') as pool:
         futures={pool.submit(copy_context().run,_generate_planned_serial,root,content_id,[label],
             replan=False,avoid_asset_ids=avoid_asset_ids,audit_level=audit_level,
@@ -905,7 +908,9 @@ def generate_planned(root,content_id,slots=None,*,replan=False,avoid_asset_ids=N
             except Exception as exc:
                 completed[label]=[{'slot':label,'status':'generation_failed','attempts':0,
                     'error_type':type(exc).__name__,'message':str(exc)[:300]}]
-            if progress_callback:progress_callback(len(completed),len(labels),active_workers)
+            if progress_callback:
+                results=[x for group in completed.values() for x in group]
+                progress_callback(len(completed),len(labels),active_workers,sum(x['status']=='success' for x in results),sum(x['status']!='success' for x in results))
     items=[item for label in labels for item in completed.get(label,[])]
     return {'plan_id':plan['plan_id'],'audit_profile':audit_profile(audit_level),
             'generation_mode':normalize_generation_mode(generation_mode),

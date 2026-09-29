@@ -2,7 +2,7 @@
 window.pintanCapture=async function(mode='full'){
   window.__pintanCaptureCancel=false;
   const originalUrl=location.href, position={x:scrollX,y:scrollY}, restore=[];
-  const CAPTURE_VERSION='2.4.4',textOnly=mode==='text_only';
+  const CAPTURE_VERSION='2.7.0',textOnly=mode==='text_only';
   const deadline=Date.now()+(textOnly?45000:180000), pause=ms=>new Promise(r=>setTimeout(r,ms));
   const roots=[['主图','[class*="gallery"], [id*="gallery"], [class*="main-img"], [class*="mainImg"]'],
     ['SKU图','[class*="skuSelection"], [id*="skuSelection"], [class*="sku-list"], [class*="skuList"]'],

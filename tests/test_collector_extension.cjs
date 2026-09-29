@@ -66,8 +66,13 @@ test('后台心跳不包含登录凭据',async()=>{
 test('manifest限定后台、站点及所需权限，弹窗不直接采集',()=>{
   const manifest=JSON.parse(fs.readFileSync(require('node:path').join(__dirname,'../extension/manifest.json'),'utf8'));
   assert.equal(manifest.background.service_worker,'background.js');
-  assert.deepEqual(manifest.permissions,['scripting','storage','alarms']);
-  assert.deepEqual(manifest.host_permissions,['https://detail.1688.com/*','https://s.1688.com/*','http://127.0.0.1:8010/*']);
+  assert.deepEqual(manifest.permissions,['scripting','storage','alarms','tabs']);
+  assert.deepEqual(manifest.host_permissions,['https://detail.1688.com/*','https://s.1688.com/*',
+    'https://s.taobao.com/*','https://item.taobao.com/*','https://detail.tmall.com/*',
+    'https://search.jd.com/*','https://item.jd.com/*','https://www.douyin.com/*',
+    'https://haohuo.jinritemai.com/*','https://buyin.jinritemai.com/*',
+    'https://myseller.taobao.com/*','https://item.upload.taobao.com/*','https://qn.taobao.com/*',
+    'https://sell.jd.com/*','https://fxg.jinritemai.com/*','http://127.0.0.1:8010/*']);
   const popup=fs.readFileSync(require('node:path').join(__dirname,'../extension/popup.js'),'utf8');
   assert.equal(popup.includes('executeScript'),false);
 });
@@ -79,6 +84,7 @@ test('扩展清单、后台连接和采集脚本版本保持一致',()=>{
   assert.equal(backgroundVersion,manifest.version);
   assert.equal(captureVersion,manifest.version);
   assert.ok(fs.existsSync(require('node:path').join(__dirname,'../extension/search_capture.js')));
+  assert.ok(fs.existsSync(require('node:path').join(__dirname,'../extension/listing_fill.js')));
 });
 test('搜索采集覆盖Shadow DOM、商品属性和内嵌offerId',()=>{
   const search=fs.readFileSync(require('node:path').join(__dirname,'../extension/search_capture.js'),'utf8');

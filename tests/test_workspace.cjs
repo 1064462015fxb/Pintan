@@ -10,7 +10,8 @@ const rows = Array.from({length:30},(_,i)=>({stable_id:String(i),title:'风扇',
 for (const n of [10,20,30]) assert.equal(filterStable(rows,'风扇','total_score','desc',String(n)).items.length,n);
 assert.equal(filterStable(rows,'数显','total_score','desc','all').total,30);
 assert.equal(filterStable(rows,'不存在').total,0);
-for (const route of ['home','selection/batch','selection/stable','selection/trending','content','distribution']) assert.equal(routeFor('#'+route),route);
+for (const route of ['home','collector/batch','collector/trending','selection/stable','selection/trending','content','distribution','distribution/product/1688-123','distribution/package/LP-123']) assert.equal(routeFor('#'+route),route);
+assert.equal(routeFor('#selection/batch'),'collector/batch');
 assert.equal(routeFor('#compliance'),'content');
 assert.equal(routeFor('#bad'),'home');
 console.log('Workspace sorting, search, quantity and routing checks passed');

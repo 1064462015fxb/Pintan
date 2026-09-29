@@ -89,8 +89,8 @@ def prepare_input(root: Path, trend_id: str) -> dict[str, Any]:
         raise ValueError("爆款不存在或主键不唯一")
     trend = matches[0]
     candidates = [r for r in read_csv(root / SEARCH_FILE) if r.get("trend_id") == trend_id]
-    if len(candidates) != 10 or len({r.get("search_id") for r in candidates}) != 10:
-        raise ValueError("该爆款必须关联恰好10条唯一候选")
+    if not 1 <= len(candidates) <= 10 or len({r.get("search_id") for r in candidates}) != len(candidates):
+        raise ValueError("该爆款必须关联1至10条唯一合格候选")
     candidates.sort(key=lambda r: r["search_id"])
     for row in candidates:
         for key in ("search_id", "title", "category", "feature_tags"):
@@ -147,7 +147,8 @@ def _check_evidence(refs: list[str], trend: dict[str, str], candidate: dict[str,
 
 def validate_compact(value: Any, payload: dict[str, Any]) -> list[dict[str, Any]]:
     records = value.get("assessments") if isinstance(value, dict) else None
-    if not isinstance(records, list) or len(records) != 10: raise ValueError("assessments 必须恰好十条")
+    expected=len(payload.get("candidates") or [])
+    if not isinstance(records, list) or len(records) != expected: raise ValueError(f"assessments 必须恰好{expected}条")
     candidates = {r["search_id"]: r for r in payload["candidates"]}
     expected_pains = set(filter(None, payload["trend"]["negative_review_pain_points"].split("|")))
     validated, errors = [], []
@@ -176,7 +177,7 @@ def validate_compact(value: Any, payload: dict[str, Any]) -> list[dict[str, Any]
             text = "; ".join(e["msg"] for e in error.errors()) if hasattr(error, "errors") else str(error)
             errors.append(f"{identity}: {text}")
     if errors: raise ValueError(" | ".join(errors))
-    if len({r["search_id"] for r in validated}) != 10: raise ValueError("候选ID重复")
+    if len({r["search_id"] for r in validated}) != expected: raise ValueError("候选ID重复")
     return sorted(validated, key=lambda r: (-r["match_score"], r["search_id"]))
 
 
@@ -275,7 +276,7 @@ def run_trending_agent(root: Path, trend_id: str, force: bool = False) -> dict[s
         if pains: schema["properties"][field]["items"] = {"type": "string", "enum": pains}
     prompt = {"mode": "compact_matching", **prepared["payload"], "assessment_schema": schema,
         "missing_evidence_policy": "空字段表示未知，不是0。爆款零售价为空时价格优势必须评0；供应商质量代理、复购率和年限均为空时供应商质量必须评0。不得补写未知值。",
-        "output": "仅返回 {assessments:[十条]}；不输出总分、排名或长文。每条理由最多60字。痛点原文各出现一次。"}
+        "output": f"仅返回 {{assessments:[{len(prepared['candidates'])}条]}}；不输出总分、排名或长文。每条理由最多60字。痛点原文各出现一次。"}
     assessments, trace, metrics = _invoke(root, prompt,
         lambda value: validate_compact(value, prepared["payload"]), "简短匹配")
     entry = {"status": "success", "cache_key": prepared["key"], "run_id": uuid.uuid4().hex,

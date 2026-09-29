@@ -21,7 +21,7 @@ from .database import (AgentTask, AngleDiagnosis, AssetAuthorization, BusinessRo
     Product, ProductAsset, StableScore, init_database, product_bundle, session_scope, utcnow)
 from .content_flow import confirm_platform, diagnose_angle, edit_platform, generate_platform, get_platform_content, save_choice
 from .media_pipeline import (authorize_asset, authorize_product_assets, collect_assets, confirm_media, generate_images,
-    generate_video, media_product, resolve_asset_file, resolve_media_file, upload_asset)
+    media_product, resolve_asset_file, resolve_media_file, upload_asset)
 from .collector import collect_snapshot, confirm_run, get_run
 from .collector_mapping import CATALOG, read_mapping, save_review
 from .collector_enrichment import run_collection_enrichment
@@ -32,6 +32,7 @@ from .image_workflow import image_source_identity
 from .content_readiness import readiness as content_readiness, require_ready
 from .task_control import Cancellation, current as cancellation_context
 from sqlalchemy import select
+from .workbench import with_covers, install_routes as install_workbench
 
 
 def with_product_link(row: dict, field: str = "product_url") -> dict:
@@ -65,7 +66,7 @@ def create_app(root: Path) -> FastAPI:
             old.status="interrupted"; old.updated_at=utcnow()
         for old in session.scalars(select(MediaTask).where(MediaTask.status.in_(["queued","running"]))):
             old.status="interrupted"; old.error_type="service_restart"
-            old.result_json=json.dumps({'error':'服务重启导致图片任务中断；历史成功图片已保留，可重新生成。'},ensure_ascii=False)
+            old.result_json=json.dumps({**json.loads(old.result_json or '{}'),'error':'服务重启导致图片任务中断；历史成功图片已保留，可重新生成。'},ensure_ascii=False)
             old.updated_at=utcnow()
     app = FastAPI(title="品探双 Agent 调试台")
     from .collector_bridge import install_collector_bridge
@@ -115,7 +116,7 @@ def create_app(root: Path) -> FastAPI:
                     return {"task_id": task_id, "deduplicated": True}
                 raise HTTPException(409, "同类任务正在运行，请等待完成")
             task_id = uuid.uuid4().hex
-            jobs[task_id] = {"status": "queued", "kind": kind, "group": group, "trend_id": trend_id, "force": force}
+            jobs[task_id] = {"status": "queued", "kind": kind, "group": group, "trend_id": trend_id, "force": force, "created_at": utcnow()}
             with session_scope(root) as session:
                 session.add(AgentTask(task_id=task_id,kind=kind,subject_id=trend_id or "",status="queued",created_at=utcnow(),updated_at=utcnow()))
             background.add_task(job, task_id, kind, trend_id, force)
@@ -151,13 +152,13 @@ def create_app(root: Path) -> FastAPI:
                     ('text_only_concept' if is_text_only_concept_slot(slot) else None)} for slot in result.get('slots',[])]}
             elif kind=="images":
                 from .image_workflow import generate_planned
-                def image_progress(done,total,workers):
+                def image_progress(done,total,workers,success=0,failed=0):
                     with guard:
                         token.check()
-                        media_jobs[task_id].update(completed_slots=done,total_slots=total,parallel_workers=workers)
+                        media_jobs[task_id].update(completed_slots=done,total_slots=total,parallel_workers=workers,success_count=success,failed_count=failed)
                     with session_scope(root) as s:
                         row=s.get(MediaTask,task_id);row.result_json=json.dumps(
-                            {'progress':{'completed_slots':done,'total_slots':total,'parallel_workers':workers}},ensure_ascii=False)
+                            {'progress':{'completed_slots':done,'total_slots':total,'parallel_workers':workers,'success_count':success,'failed_count':failed}},ensure_ascii=False)
                         row.updated_at=utcnow()
                 result=generate_planned(root,payload["content_id"],payload.get("slots"),
                     replan=payload.get('replan',False),avoid_asset_ids=payload.get('avoid_asset_ids'),
@@ -165,7 +166,21 @@ def create_app(root: Path) -> FastAPI:
                     generation_mode=payload.get('generation_mode','conservative'),
                     slot_modes=payload.get('slot_modes'),user_feedback=payload.get('user_feedback',''),
                     parent_media_id=payload.get('parent_media_id'),progress_callback=image_progress)
-            elif kind=="video":result=generate_video(root,payload["content_id"])
+            elif kind=="video-plan":
+                from .video_workflow import plan_video
+                result=plan_video(root,payload["content_id"],payload.get("generation_mode","conservative"),
+                    payload.get("aspect_ratio","auto"),payload.get("force",False))
+            elif kind=="video":
+                from .video_workflow import generate_video
+                def video_progress(done,total,workers,success=0,failed=0):
+                    with guard:
+                        token.check();media_jobs[task_id].update(completed_slots=done,total_slots=total,
+                            parallel_workers=workers,success_count=success,failed_count=failed)
+                    with session_scope(root) as s:
+                        row=s.get(MediaTask,task_id);row.result_json=json.dumps(
+                            {'progress':{'completed_slots':done,'total_slots':total,'parallel_workers':workers,
+                            'success_count':success,'failed_count':failed}},ensure_ascii=False);row.updated_at=utcnow()
+                result=generate_video(root,payload["content_id"],payload.get("plan_id"),payload.get("shot_indexes"),video_progress)
             else:raise ValueError("未知媒体任务")
             with guard:
                 token.check()
@@ -177,7 +192,7 @@ def create_app(root: Path) -> FastAPI:
                 if token.event.is_set():return
                 with session_scope(root) as s:
                     row=s.get(MediaTask,task_id);row.status="failed";row.error_type=type(exc).__name__
-                    row.result_json=json.dumps({'error':str(exc)[:500]},ensure_ascii=False);row.updated_at=utcnow()
+                    row.result_json=json.dumps({**json.loads(row.result_json or '{}'),'error':str(exc)[:500]},ensure_ascii=False);row.updated_at=utcnow()
                 media_jobs[task_id].update(status="failed",error=f"{type(exc).__name__}: {str(exc)}")
         finally:
             cancellation_context.reset(context)
@@ -214,6 +229,12 @@ def create_app(root: Path) -> FastAPI:
 
     @app.get("/app.js")
     def script(): return FileResponse(root / "src/pintan/static/app.js", media_type="application/javascript", headers={"Cache-Control":"no-store"})
+
+    @app.get('/workbench.js')
+    def workbench_script(): return FileResponse(root/'src/pintan/static/workbench.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
+
+    @app.get('/workbench.css')
+    def workbench_style(): return FileResponse(root/'src/pintan/static/workbench.css',media_type='text/css',headers={'Cache-Control':'no-store'})
 
     @app.post("/api/collector/capture")
     def collector_capture(payload:dict=Body(...)):
@@ -406,7 +427,7 @@ def create_app(root: Path) -> FastAPI:
         elif not any(r.get('total_score') not in (None,'') for r in rows):
             from .stable import deterministic_report
             report=deterministic_report(rows)
-        items = [with_product_link(r) for r in rows]
+        items = with_covers(root, [with_product_link(r) for r in rows])
         return {"top10": items[:10], "items": items, "scored": bool(rows and rows[0].get("total_score")), "report": report}
 
     @app.get('/api/selection/candidates')
@@ -416,7 +437,7 @@ def create_app(root: Path) -> FastAPI:
                 select(BusinessRow).where(BusinessRow.kind=='candidate'))]
         rows.sort(key=lambda x:(x.get('promotion_status')=='rejected',
                                 -float(x.get('total_score') or 0),x.get('title') or ''))
-        return {'items':[with_product_link(x) for x in rows],
+        return {'items':with_covers(root,[with_product_link(x) for x in rows]),
                 'count':len(rows),'version':'stable-rules-v5-three-pillars'}
 
     @app.post('/api/selection/candidates/{product_id}/inputs')
@@ -466,20 +487,22 @@ def create_app(root: Path) -> FastAPI:
         return {'items':score_stable_products(root)}
 
     @app.get("/api/trends")
-    def trends(): return {"items": [with_product_link(r) for r in read_csv(root / TREND_FILE)]}
+    def trends(): return {"items": with_covers(root,[with_product_link(r) for r in read_csv(root / TREND_FILE)])}
 
     @app.get("/api/trends/{trend_id}")
     def trend(trend_id: str):
         record = next((x for x in read_csv(root / TREND_FILE) if x["trend_id"] == trend_id), None)
         if not record: raise HTTPException(404, "爆款不存在")
         rows = [x for x in read_csv(root / SEARCH_FILE) if x["trend_id"] == trend_id]
-        ranked = sorted((x for x in rows if x.get("match_rank")), key=lambda x: int(x["match_rank"]))
+        eligible=[x for x in rows if x.get('gate_status')!='淘汰']
+        rejected=[x for x in rows if x.get('gate_status')=='淘汰']
+        ranked = sorted((x for x in eligible if x.get("match_rank")), key=lambda x: int(x["match_rank"]))
         try: latest = latest_match(root, trend_id)
         except ValueError: latest = None
         metadata = {k: latest.get(k) for k in ("cache_hit", "cache_key", "run_id", "elapsed_seconds", "generated_at", "generation_seconds", "stale")} if latest else None
         details = read_details(root, latest) if latest else None
-        return {"trend": with_product_link(record), "candidate_count": len(rows), "top3": [with_product_link(r, "offer_url") for r in ranked[:3]], "all10": [with_product_link(r, "offer_url") for r in rows],
-                "metadata": metadata, "details": details}
+        return {"trend": with_covers(root,[with_product_link(record)])[0], "candidate_count": len(eligible), "top3": with_covers(root,[with_product_link(r, "offer_url") for r in ranked[:3]]), "all10": with_covers(root,[with_product_link(r, "offer_url") for r in eligible[:10]]),
+                "rejected":with_covers(root,[with_product_link(r,"offer_url") for r in rejected]),"metadata": metadata, "details": details}
 
     @app.post("/api/tasks/stable", status_code=202)
     def start_stable(background: BackgroundTasks):
@@ -499,9 +522,11 @@ def create_app(root: Path) -> FastAPI:
 
     @app.get("/api/tasks/{task_id}")
     def task(task_id: str):
-        with guard:
-            if task_id not in jobs: raise HTTPException(404, "任务不存在或服务已重启（此前任务视为中断）")
-            return dict(jobs[task_id])
+        with guard: data=dict(jobs.get(task_id,{}))
+        with session_scope(root) as s: row=s.get(AgentTask,task_id)
+        if not row: raise HTTPException(404, '任务不存在')
+        return {**data,'status':row.status,'kind':row.kind,'stage':row.kind,'created_at':row.created_at,
+                'updated_at':row.updated_at,'error':data.get('error') or ('服务已重启，请重新开始' if row.status=='interrupted' else None)}
 
     @app.get("/api/content/candidates")
     def content_candidates(trend_id: str | None = None):
@@ -525,7 +550,7 @@ def create_app(root: Path) -> FastAPI:
                     "title":p.title,"source":"已入库测试素材","rank":None,"default_selected":False}
                    for p in test_products if p.product_id not in known]
         # 前端以 product_id 去重，优先保留带爆款上下文的候选。
-        return {"items":result}
+        return {"items":with_covers(root,result)}
 
     @app.get("/api/content/products/{product_id}/readiness")
     def product_readiness(product_id:str):
@@ -735,30 +760,66 @@ def create_app(root: Path) -> FastAPI:
             'user_feedback':feedback.strip(),'parent_media_id':media_id,
             'generation_mode':retained,'slot_modes':({item.slot:actual} if actual in {'conservative','creative'} else {})})
 
-    @app.post("/api/media/video",status_code=202)
-    def video(background:BackgroundTasks,payload:dict=Body(...)):
+    @app.post("/api/media/video/plan",status_code=202)
+    def video_plan(background:BackgroundTasks,payload:dict=Body(...)):
         content_id=str(payload.get("content_id","")).strip()
         try:get_platform_content(root,content_id)
         except ValueError as exc:raise HTTPException(404,str(exc)) from None
-        return submit_media(background,"video",{"content_id":content_id})
+        mode=str(payload.get('generation_mode','conservative'));ratio=str(payload.get('aspect_ratio','auto'))
+        if mode not in {'conservative','creative'}:raise HTTPException(422,'短视频模式无效')
+        if ratio not in {'auto','9:16','1:1','16:9'}:raise HTTPException(422,'短视频比例无效')
+        return submit_media(background,"video-plan",{"content_id":content_id,'generation_mode':mode,
+            'aspect_ratio':ratio,'force':bool(payload.get('force',False))})
+
+    @app.get("/api/media/video/plan")
+    def video_plan_latest(content_id:str):
+        from .video_workflow import latest_video_plan
+        value=latest_video_plan(root,content_id)
+        return {'plan':value}
+
+    @app.post("/api/media/video",status_code=202)
+    def video(background:BackgroundTasks,payload:dict=Body(...)):
+        content_id=str(payload.get("content_id","")).strip();plan_id=str(payload.get('plan_id','')).strip()
+        try:get_platform_content(root,content_id)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+        if not plan_id:raise HTTPException(422,'请先生成并确认15秒分镜')
+        return submit_media(background,"video",{"content_id":content_id,'plan_id':plan_id})
+
+    @app.post("/api/media/video/{plan_id}/retry",status_code=202)
+    def video_retry(plan_id:str,background:BackgroundTasks,payload:dict=Body(default={})):
+        from .video_workflow import video_plan
+        try:plan=video_plan(root,plan_id)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from None
+        indexes=payload.get('shot_indexes')
+        if indexes is None:indexes=[x['index'] for x in plan['shots'] if x['status']!='success']
+        if not isinstance(indexes,list) or not indexes:raise HTTPException(422,'没有需要重试的镜头')
+        try:indexes=sorted({int(x) for x in indexes})
+        except (TypeError,ValueError):raise HTTPException(422,'镜头编号无效') from None
+        if any(x<1 or x>5 for x in indexes):raise HTTPException(422,'镜头编号必须在1到5之间')
+        return submit_media(background,"video",{"content_id":plan['content_id'],'plan_id':plan_id,'shot_indexes':indexes})
 
     @app.get('/api/media/tasks')
-    def active_media_tasks(content_id:str):
+    def active_media_tasks(content_id:str, include_finished:bool=False):
         with session_scope(root) as s:
-            rows=s.scalars(select(MediaTask).where(MediaTask.content_id==content_id,
-                MediaTask.status.in_(['queued','running'])).order_by(MediaTask.created_at.desc())).all()
+            query=select(MediaTask).where(MediaTask.content_id==content_id)
+            if not include_finished:query=query.where(MediaTask.status.in_(['queued','running']))
+            rows=s.scalars(query.order_by(MediaTask.created_at.desc()).limit(20)).all()
             return {'items':[{'task_id':r.task_id,'status':r.status,'kind':r.kind,
                 'created_at':r.created_at} for r in rows]}
 
     @app.get("/api/media/tasks/{task_id}")
     def media_task(task_id:str):
         with guard:
-            if task_id in media_jobs:return dict(media_jobs[task_id])
+            live=dict(media_jobs.get(task_id,{}))
         with session_scope(root) as s:row=s.get(MediaTask,task_id)
         if not row:raise HTTPException(404,"媒体任务不存在")
         result=json.loads(row.result_json) if row.result_json else None
         error=(result or {}).get('error') if isinstance(result,dict) else None
-        return {"status":row.status,"kind":row.kind,"created_at":row.created_at,"result":result,
+        progress=(result or {}).get('progress',{}) if isinstance(result,dict) else {}
+        items=(result or {}).get('items',[]) if isinstance(result,dict) else []
+        if row.kind in {'images','video'} and row.status=='completed':
+            progress.update(completed_slots=len(items),total_slots=len(items),success_count=sum(x.get('status')=='success' for x in items),failed_count=sum(x.get('status')!='success' for x in items))
+        return {**live,**progress,"status":row.status,"kind":row.kind,"stage":row.kind,"created_at":row.created_at,"updated_at":row.updated_at,"result":result,
                 "error":error or (f"{row.error_type}: 任务未完成" if row.error_type else None)}
 
     @app.post("/api/media/tasks/{task_id}/cancel")
@@ -774,7 +835,7 @@ def create_app(root: Path) -> FastAPI:
                 token=media_cancellations.get(task_id)
                 if token:token.cancel()
                 row.status='cancelled';row.error_type='user_cancelled'
-                row.result_json=json.dumps({'error':message},ensure_ascii=False);row.updated_at=utcnow()
+                row.result_json=json.dumps({**json.loads(row.result_json or '{}'),'error':message},ensure_ascii=False);row.updated_at=utcnow()
             item=media_jobs.get(task_id)
             if item:item.update(status='cancelled',error=message)
         return {'task_id':task_id,'status':'cancelled','message':message}
@@ -818,6 +879,8 @@ def create_app(root: Path) -> FastAPI:
                     GeneratedMedia.status=='success',
                 ).order_by(GeneratedMedia.created_at.desc())).all()
                 for item in rows:
+                    if json.loads(item.metadata_json or '{}').get('content_version') != version.version:
+                        continue
                     key=(item.media_type,item.slot)
                     if key in latest_media:
                         continue
@@ -853,4 +916,5 @@ def create_app(root: Path) -> FastAPI:
     def approve_media(media_id:str):
         try:return confirm_media(root,media_id)
         except ValueError as exc:raise HTTPException(404,str(exc)) from None
+    install_workbench(app,root,distribution_ready)
     return app

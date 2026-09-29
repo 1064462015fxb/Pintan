@@ -70,10 +70,10 @@ def validate_three_tables(root: Path) -> dict[str, int]:
         if not rows or "" in ids or len(ids) != len(set(ids)):
             raise ValueError(f"{label}表为空、主键缺失或重复")
     trend_ids = {r["trend_id"] for r in trends}
-    counts = Counter(r.get("trend_id") for r in searches)
-    if set(counts) != trend_ids or any(counts[k] != 10 for k in trend_ids):
-        raise ValueError("每个爆款必须且只能关联 10 条搜索候选")
+    counts = Counter(r.get("trend_id") for r in searches if r.get("gate_status") != "淘汰")
+    if set(counts)-trend_ids or any(not 1 <= count <= 10 for count in counts.values()):
+        raise ValueError("已产生平替结果的爆款必须关联1至10条合格候选")
     for row in stable + searches:
-        if row.get("verification_status") != "待复核" or row.get("data_origin") != "model_processed_demo":
-            raise ValueError("演示商品必须标记 model_processed_demo / 待复核")
+        if row.get("data_origin") == "model_processed_demo" and row.get("verification_status") != "待复核":
+            raise ValueError("演示商品必须标记为待复核")
     return {"stable_products": len(stable), "trends": len(trends), "search_results": len(searches)}
